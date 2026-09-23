@@ -8,8 +8,9 @@ Locust desk-mix load tests for ERPNext site **`performance`** (Phase 19 concurre
 # 1. Install Locust into the bench env (once)
 ./env/bin/pip install -r apps/performance_testing/requirements-loadtest.txt
 
-# 2. Seed masters + 100 perf_* users + API keys
+# 2. Seed 10 companies + masters + 100 perf_* users + API keys
 bench --site performance execute performance_testing.setup.seed_loadtest.seed
+# writes loadtest/users.json and loadtest/companies.json
 
 # 3. Ensure site is serving (bench start → port 8006)
 # 4. Run Locust UI
@@ -29,16 +30,18 @@ Ramp: 5 → 10 → 25 → 50 → **100** users. HTML/CSV reports land in `loadte
 
 ## Desk mix (Locust weights)
 
-| Persona class | Weight | Users @100 |
-|---|---:|---:|
-| SalesUser | 25 | 25 |
-| PurchaseUser | 15 | 15 |
-| StockUser | 15 | 15 |
-| AccountsUser | 20 | 20 |
-| ManufacturingUser | 10 | 10 |
-| ReportUser | 15 | 15 |
+| Persona class | Weight | Users @100 | Write path |
+|---|---:|---:|---|
+| SalesUser | 25 | 25 | **SO → Sales Invoice → Payment Entry** (random company) |
+| PurchaseUser | 15 | 15 | **PO → Purchase Receipt → Purchase Invoice → Payment** (random company) |
+| StockUser | 15 | 15 | Stock Entry / stock reports |
+| AccountsUser | 20 | 20 | Journal Entry / GL |
+| ManufacturingUser | 10 | 10 | Work Order / BOM lists |
+| ReportUser | 15 | 15 | P&L, TB, Stock Balance, Sales Register |
 
-Think time 3–8s. Hits Desk endpoints: login / list / getdoc / savedocs / query_report (not full Playwright).
+Each sales/purchase transaction picks a **random company** from the 10 seeded `PERF Company 01` … `10` entries in `companies.json`.
+
+Think time 3–8s. Hits Desk endpoints: login / list / getdoc / savedocs / query_report / make_* mappers (not full Playwright).
 
 ## Config env vars
 

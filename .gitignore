@@ -56,6 +56,7 @@ jspm_packages/
 
 # Locust credentials / run artifacts
 loadtest/users.json
+loadtest/companies.json
 loadtest/results_*
 loadtest/*.html
 __pycache__/

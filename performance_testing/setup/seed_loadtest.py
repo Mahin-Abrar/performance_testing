@@ -1,9 +1,11 @@
-"""Seed masters + perf_* users + API keys for Locust desk-mix on site `performance`.
+"""Seed 10 companies + masters + perf_* users for Locust multi-company desk mix.
 
 Run:
   bench --site performance execute performance_testing.setup.seed_loadtest.seed
 
-Writes credentials to apps/performance_testing/loadtest/users.json (gitignored).
+Writes:
+  apps/performance_testing/loadtest/users.json
+  apps/performance_testing/loadtest/companies.json
 """
 
 from __future__ import annotations
@@ -14,14 +16,9 @@ from pathlib import Path
 import frappe
 from frappe.utils.password import update_password
 
-COMPANY = "Fusion"
 PASSWORD = "PerfTest@123"
-
-
-def _users_json_path() -> Path:
-	# app path is .../performance_testing/performance_testing → parent is app root
-	return Path(frappe.get_app_path("performance_testing")).parent / "loadtest" / "users.json"
-
+COMPANY_COUNT = 10
+TEMPLATE_COMPANY = "Fusion"  # used for CoA / country / currency if present
 
 PERSONA_COUNTS = {
 	"sales": 25,
@@ -42,25 +39,99 @@ PERSONA_ROLES = {
 }
 
 
+def _app_root() -> Path:
+	return Path(frappe.get_app_path("performance_testing")).parent
+
+
+def _users_json_path() -> Path:
+	return _app_root() / "loadtest" / "users.json"
+
+
+def _companies_json_path() -> Path:
+	return _app_root() / "loadtest" / "companies.json"
+
+
 def seed():
-	"""Create minimal masters and 100 Locust users; write users.json."""
-	# Bypass User creation throttle (default 60 users / minute)
+	"""Create 10 companies, masters, stock, 100 Locust users; write JSON files."""
 	frappe.flags.in_import = True
-	_ensure_masters()
-	users = _ensure_users()
-	path = _users_json_path()
-	path.parent.mkdir(parents=True, exist_ok=True)
-	path.write_text(json.dumps(users, indent=2))
+	companies = _ensure_companies()
+	_ensure_shared_masters()
+	_ensure_opening_stock(companies)
+	users = _ensure_users(companies)
+	_write_json(_users_json_path(), users)
+	_write_json(_companies_json_path(), companies)
 	frappe.db.commit()
-	print(f"Seeded {len(users)} users → {path}")
-	print(f"Company={COMPANY} password={PASSWORD}")
-	return {"users": len(users), "users_file": str(path)}
+	print(f"Seeded {len(companies)} companies → {_companies_json_path()}")
+	print(f"Seeded {len(users)} users → {_users_json_path()}")
+	print(f"password={PASSWORD}")
+	return {
+		"companies": len(companies),
+		"users": len(users),
+		"companies_file": str(_companies_json_path()),
+		"users_file": str(_users_json_path()),
+	}
 
 
-def _ensure_masters():
-	if not frappe.db.exists("Company", COMPANY):
-		frappe.throw(f"Company {COMPANY} missing on this site")
+def _write_json(path: Path, data):
+	path.parent.mkdir(parents=True, exist_ok=True)
+	path.write_text(json.dumps(data, indent=2))
 
+
+def _template_company() -> str:
+	if frappe.db.exists("Company", TEMPLATE_COMPANY):
+		return TEMPLATE_COMPANY
+	name = frappe.db.get_value("Company", {}, "name")
+	if not name:
+		frappe.throw("No Company found to use as chart-of-accounts template")
+	return name
+
+
+def _ensure_companies() -> list[dict]:
+	template = _template_company()
+	tmpl = frappe.get_doc("Company", template)
+	companies: list[dict] = []
+
+	for i in range(1, COMPANY_COUNT + 1):
+		name = f"PERF Company {i:02d}"
+		abbr = f"PC{i:02d}"
+		if not frappe.db.exists("Company", name):
+			doc = frappe.get_doc(
+				{
+					"doctype": "Company",
+					"company_name": name,
+					"abbr": abbr,
+					"default_currency": tmpl.default_currency,
+					"country": tmpl.country,
+					"valuation_method": tmpl.valuation_method or "FIFO",
+					"create_chart_of_accounts_based_on": "Existing Company",
+					"existing_company": template,
+				}
+			)
+			doc.insert(ignore_permissions=True)
+			frappe.db.commit()
+
+		warehouse = (
+			frappe.db.get_value("Warehouse", {"company": name, "warehouse_name": "Stores"}, "name")
+			or frappe.db.get_value("Warehouse", {"company": name, "is_group": 0}, "name")
+		)
+		cash = frappe.db.get_value(
+			"Account", {"company": name, "account_type": "Cash", "is_group": 0}, "name"
+		) or frappe.db.get_value("Account", {"company": name, "account_type": "Bank", "is_group": 0}, "name")
+		cost_center = frappe.db.get_value("Cost Center", {"company": name, "is_group": 0}, "name")
+
+		companies.append(
+			{
+				"name": name,
+				"abbr": abbr,
+				"warehouse": warehouse,
+				"cash_account": cash,
+				"cost_center": cost_center,
+			}
+		)
+	return companies
+
+
+def _ensure_shared_masters():
 	if not frappe.db.exists("UOM", "Nos"):
 		frappe.get_doc({"doctype": "UOM", "uom_name": "Nos"}).insert(ignore_permissions=True)
 
@@ -107,13 +178,52 @@ def _ensure_masters():
 			).insert(ignore_permissions=True)
 
 
+def _ensure_opening_stock(companies: list[dict]):
+	"""Put stock in each company warehouse so SO→SI with update_stock works."""
+	items = frappe.get_all("Item", filters={"item_code": ("like", "PERF-ITEM-%")}, pluck="name")
+	for company in companies:
+		wh = company.get("warehouse")
+		if not wh:
+			continue
+		# One receipt per company if none exists yet for PERF items
+		exists = frappe.db.exists(
+			"Stock Entry",
+			{"company": company["name"], "stock_entry_type": "Material Receipt", "docstatus": 1},
+		)
+		if exists:
+			continue
+		doc = frappe.get_doc(
+			{
+				"doctype": "Stock Entry",
+				"company": company["name"],
+				"stock_entry_type": "Material Receipt",
+				"purpose": "Material Receipt",
+				"to_warehouse": wh,
+				"items": [
+					{
+						"item_code": item,
+						"qty": 500,
+						"t_warehouse": wh,
+						"basic_rate": 50,
+						"allow_zero_valuation_rate": 1,
+					}
+					for item in items
+				],
+			}
+		)
+		doc.insert(ignore_permissions=True)
+		doc.submit()
+		frappe.db.commit()
+
+
 def _ensure_role(role: str):
 	if not frappe.db.exists("Role", role):
 		frappe.get_doc({"doctype": "Role", "role_name": role, "desk_access": 1}).insert(ignore_permissions=True)
 
 
-def _ensure_users() -> list[dict]:
+def _ensure_users(companies: list[dict]) -> list[dict]:
 	out: list[dict] = []
+	company_names = [c["name"] for c in companies]
 	for persona, count in PERSONA_COUNTS.items():
 		for i in range(1, count + 1):
 			email = f"perf_{persona}_{i:02d}@example.com"
@@ -139,20 +249,22 @@ def _ensure_users() -> list[dict]:
 
 			user.enabled = 1
 			existing = {r.role for r in user.roles}
-			changed = False
 			for role in [*roles, "Desk User"]:
 				if role not in existing and frappe.db.exists("Role", role):
 					user.append("roles", {"role": role})
-					changed = True
 
-			# Fresh API credentials (plaintext secret returned once via Password field)
 			api_key = user.api_key or frappe.generate_hash(length=15)
 			api_secret = frappe.generate_hash(length=15)
 			user.api_key = api_key
 			user.api_secret = api_secret
 			user.save(ignore_permissions=True)
 
-			frappe.defaults.set_user_default("company", COMPANY, email)
+			# Default company rotates; Locust still picks randomly per transaction
+			default_company = company_names[(i - 1) % len(company_names)]
+			frappe.defaults.set_user_default("company", default_company, email)
+
+			# Clear company user-permissions so all 10 companies are usable
+			frappe.db.delete("User Permission", {"user": email, "allow": "Company"})
 
 			out.append(
 				{
@@ -161,6 +273,7 @@ def _ensure_users() -> list[dict]:
 					"persona": persona,
 					"api_key": api_key,
 					"api_secret": api_secret,
+					"default_company": default_company,
 				}
 			)
 	return out

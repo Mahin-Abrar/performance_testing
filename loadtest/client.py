@@ -183,9 +183,15 @@ class FrappeDeskClient:
 
 	def savedocs(self, doc: dict, action: str = "Save") -> dict | None:
 		name = "submit" if action == "Submit" else "save"
+		payload = dict(doc)
+		# Mapped docs from make_* often set __islocal without a temp name; savedocs crashes.
+		if action == "Save" and (payload.get("__islocal") or not payload.get("name")):
+			dt = (payload.get("doctype") or "doc").lower().replace(" ", "-")
+			payload["name"] = f"new-{dt}-{random.randint(100000, 999999)}"
+			payload["__islocal"] = 1
 		with self.client.post(
 			"/api/method/frappe.desk.form.save.savedocs",
-			data={"doc": json.dumps(doc), "action": action},
+			data={"doc": json.dumps(payload), "action": action},
 			headers=self._headers({"Content-Type": "application/x-www-form-urlencoded"}),
 			name=f"{name}:{doc.get('doctype')}",
 			catch_response=True,
@@ -194,17 +200,17 @@ class FrappeDeskClient:
 				resp.failure(f"{action} HTTP {resp.status_code}: {resp.text[:200]}")
 				return None
 			try:
-				payload = resp.json()
+				body = resp.json()
 			except Exception:
 				resp.failure(f"{action} non-json")
 				return None
-			if payload.get("exc") or payload.get("exception"):
+			if body.get("exc") or body.get("exception"):
 				# Expected when masters missing / permission — count as failure for SLO
-				resp.failure(str(payload.get("exception") or payload.get("_server_messages") or "")[:240])
+				resp.failure(str(body.get("exception") or body.get("_server_messages") or "")[:240])
 				return None
 			resp.success()
-			docs = payload.get("docs") or []
-			return docs[0] if docs else payload
+			docs = body.get("docs") or []
+			return docs[0] if docs else body
 
 	def run_report(self, report_name: str, filters: dict | None = None) -> None:
 		data = {
@@ -233,6 +239,30 @@ class FrappeDeskClient:
 				resp.failure(str(payload.get("exception") or "")[:200])
 				return
 			resp.success()
+
+	def call_method(self, method: str, args: dict | None = None, name: str | None = None) -> dict | None:
+		"""Call a whitelisted ERPNext/Frappe method; returns message dict/list."""
+		data = dict(args or {})
+		with self.client.post(
+			f"/api/method/{method}",
+			data={k: (json.dumps(v) if isinstance(v, (dict, list)) else v) for k, v in data.items()},
+			headers=self._headers({"Content-Type": "application/x-www-form-urlencoded"}),
+			name=name or f"method:{method.split('.')[-1]}",
+			catch_response=True,
+		) as resp:
+			if resp.status_code != 200:
+				resp.failure(f"{method} HTTP {resp.status_code}: {resp.text[:200]}")
+				return None
+			try:
+				payload = resp.json()
+			except Exception:
+				resp.failure(f"{method} non-json")
+				return None
+			if payload.get("exc") or payload.get("exception"):
+				resp.failure(str(payload.get("exception") or payload.get("_server_messages") or "")[:240])
+				return None
+			resp.success()
+			return payload.get("message")
 
 	def desk_ping(self) -> None:
 		"""Light Desk touch without loading full /app HTML."""
