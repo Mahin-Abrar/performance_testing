@@ -53,3 +53,10 @@ jspm_packages/
 
 # Aider AI Chat
 .aider*
+
+# Locust credentials / run artifacts
+loadtest/users.json
+loadtest/results_*
+loadtest/*.html
+__pycache__/
+loadtest/__pycache__/
