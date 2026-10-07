@@ -21,8 +21,13 @@ def _today() -> str:
 	return date.today().isoformat()
 
 
-def _future(days: int = 7) -> str:
-	return (date.today() + timedelta(days=days)).isoformat()
+def _random_date() -> date:
+	today = date.today()
+	return config.DATE_FROM + timedelta(days=random.randint(0, max((today - config.DATE_FROM).days, 0)))
+
+
+def _plus(d: date, days: int = 7) -> str:
+	return (d + timedelta(days=days)).isoformat()
 
 
 def _month_start() -> str:
@@ -74,10 +79,44 @@ class DeskMixUser(HttpUser):
 			self._cache["items"] = [r["name"] for r in self.desk.list_docs("Item", limit=50) if r.get("name")]
 		return random.choice(self._cache["items"]) if self._cache["items"] else None
 
+	def _random_bom(self, company: dict) -> dict | None:
+		key = f"boms:{company['name']}"
+		if key not in self._cache:
+			self._cache[key] = self.desk.list_docs(
+				"BOM",
+				limit=200,
+				filters=[
+					["company", "=", company["name"]],
+					["is_active", "=", 1],
+					["docstatus", "=", 1],
+				],
+				fields=["name", "item"],
+			)
+		return random.choice(self._cache[key]) if self._cache[key] else None
+
+	def _save_submit(self, doc: dict) -> dict | None:
+		doctype = doc["doctype"]
+		saved = self.desk.savedocs(doc, "Save")
+		if not saved or not saved.get("name"):
+			return None
+		saved["doctype"] = doctype
+		submitted = self.desk.savedocs(saved, "Submit")
+		return submitted if submitted and submitted.get("name") else None
+
+	def _map(self, method: str, source_name: str, doctype: str, **fields) -> dict | None:
+		"""Run an ERPNext make_* mapper, apply overrides, then save + submit."""
+		doc = self.desk.call_method(
+			method, {"source_name": source_name}, name=f"flow:{method.rsplit('.', 1)[-1]}"
+		)
+		if not doc:
+			return None
+		doc.update(doctype=doctype, **fields)
+		return self._save_submit(doc)
+
 	def after_loop(self):
 		self.desk.maybe_relogin(0.05)
 
-	def _payment_against_invoice(self, invoice_doctype: str, invoice_name: str, company: dict):
+	def _payment_against_invoice(self, invoice_doctype: str, invoice_name: str, company: dict, posting: str):
 		pe = self.desk.call_method(
 			"erpnext.accounts.doctype.payment_entry.payment_entry.get_payment_entry",
 			{"dt": invoice_doctype, "dn": invoice_name},
@@ -87,7 +126,7 @@ class DeskMixUser(HttpUser):
 			return
 		pe["doctype"] = "Payment Entry"
 		pe["company"] = company["name"]
-		pe["posting_date"] = _today()
+		pe["posting_date"] = posting
 		if company.get("cash_account"):
 			if pe.get("payment_type") == "Receive":
 				pe["paid_to"] = company["cash_account"]
@@ -101,7 +140,7 @@ class DeskMixUser(HttpUser):
 
 
 class SalesUser(DeskMixUser):
-	"""Sales Order → Sales Invoice (update stock) → Payment Entry; random company each run."""
+	"""[Quotation →] Sales Order → [Delivery Note →] Sales Invoice → Payment; FG items half the time."""
 
 	persona = "sales"
 	weight = 25
@@ -113,76 +152,107 @@ class SalesUser(DeskMixUser):
 
 	@task(1)
 	def browse(self):
-		self._list_and_open("Sales Order")
+		self._list_and_open(random.choice(["Quotation", "Sales Order", "Delivery Note"]))
 		self._list_and_open("Sales Invoice")
 		self.after_loop()
 
 	def _run_sales_flow(self):
 		company = self._company()
 		customer = self._random_customer()
-		item = self._random_item()
+		bom = self._random_bom(company)
+		item = bom["item"] if bom and random.random() < 0.5 else self._random_item()
 		wh = company.get("warehouse")
 		if not customer or not item or not wh:
 			return
 
-		qty = random.randint(1, 3)
-		rate = random.choice([100, 150, 200])
-
-		so = {
-			"doctype": "Sales Order",
-			"company": company["name"],
-			"customer": customer,
-			"transaction_date": _today(),
-			"delivery_date": _future(7),
-			"order_type": "Sales",
-			"selling_price_list": config.SEED["selling_price_list"],
-			"set_warehouse": wh,
-			"ignore_pricing_rule": 1,
-			"items": [
-				{
-					"doctype": "Sales Order Item",
-					"item_code": item,
-					"qty": qty,
-					"rate": rate,
-					"delivery_date": _future(7),
-					"warehouse": wh,
-				}
-			],
+		day = _random_date()
+		posting = day.isoformat()
+		delivery = _plus(day)
+		row = {
+			"item_code": item,
+			"qty": random.randint(1, 3),
+			"rate": random.choice([100, 150, 200]),
+			"warehouse": wh,
 		}
-		so = self.desk.savedocs(so, "Save")
-		if not so or not so.get("name"):
-			return
-		so["doctype"] = "Sales Order"
-		so = self.desk.savedocs(so, "Submit")
-		if not so or not so.get("name"):
+		base = {
+			"company": company["name"],
+			"selling_price_list": config.SEED["selling_price_list"],
+			"ignore_pricing_rule": 1,
+		}
+
+		if random.random() < 0.3:
+			# Quotation → Sales Order; ERPNext only converts quotations still valid today
+			qtn = self._save_submit(
+				{
+					**base,
+					"doctype": "Quotation",
+					"quotation_to": "Customer",
+					"party_name": customer,
+					"transaction_date": posting,
+					"valid_till": _plus(date.today(), 30),
+					"items": [{**row, "doctype": "Quotation Item"}],
+				}
+			)
+			if not qtn:
+				return
+			so = self.desk.call_method(
+				"erpnext.selling.doctype.quotation.quotation.make_sales_order",
+				{"source_name": qtn["name"]},
+				name="flow:make_sales_order",
+			)
+			if not so:
+				return
+			so.update(doctype="Sales Order", transaction_date=posting, delivery_date=delivery, set_warehouse=wh)
+			for r in so.get("items") or []:
+				r.update(delivery_date=delivery, warehouse=wh)
+		else:
+			so = {
+				**base,
+				"doctype": "Sales Order",
+				"customer": customer,
+				"transaction_date": posting,
+				"delivery_date": delivery,
+				"order_type": "Sales",
+				"set_warehouse": wh,
+				"items": [{**row, "doctype": "Sales Order Item", "delivery_date": delivery}],
+			}
+		so = self._save_submit(so)
+		if not so:
 			return
 
-		# SO → Sales Invoice
-		si = self.desk.call_method(
-			"erpnext.selling.doctype.sales_order.sales_order.make_sales_invoice",
-			{"source_name": so["name"]},
-			name="flow:make_sales_invoice",
-		)
-		if not si:
-			return
-		si["doctype"] = "Sales Invoice"
-		si["update_stock"] = 1
-		si["posting_date"] = _today()
-		si["set_warehouse"] = wh
-		si["company"] = company["name"]
-		si = self.desk.savedocs(si, "Save")
-		if not si or not si.get("name"):
-			return
-		si["doctype"] = "Sales Invoice"
-		si = self.desk.savedocs(si, "Submit")
-		if not si or not si.get("name"):
-			return
-
-		self._payment_against_invoice("Sales Invoice", si["name"], company)
+		stock = {"company": company["name"], "set_posting_time": 1, "posting_date": posting}
+		if random.random() < 0.4:
+			dn = self._map(
+				"erpnext.selling.doctype.sales_order.sales_order.make_delivery_note",
+				so["name"],
+				"Delivery Note",
+				**stock,
+			)
+			if not dn:
+				return
+			si = self._map(
+				"erpnext.stock.doctype.delivery_note.delivery_note.make_sales_invoice",
+				dn["name"],
+				"Sales Invoice",
+				due_date=posting,
+				**stock,
+			)
+		else:
+			si = self._map(
+				"erpnext.selling.doctype.sales_order.sales_order.make_sales_invoice",
+				so["name"],
+				"Sales Invoice",
+				update_stock=1,
+				set_warehouse=wh,
+				due_date=posting,
+				**stock,
+			)
+		if si:
+			self._payment_against_invoice("Sales Invoice", si["name"], company, posting)
 
 
 class PurchaseUser(DeskMixUser):
-	"""Purchase Order → Purchase Receipt → Purchase Invoice → Payment; random company."""
+	"""[Material Request →] PO → Purchase Receipt → Purchase Invoice → Payment; BOM raw materials half the time."""
 
 	persona = "purchase"
 	weight = 15
@@ -194,86 +264,106 @@ class PurchaseUser(DeskMixUser):
 
 	@task(1)
 	def browse(self):
-		self._list_and_open("Purchase Order")
+		self._list_and_open(random.choice(["Material Request", "Purchase Order", "Purchase Receipt"]))
 		self._list_and_open("Purchase Invoice")
 		self.after_loop()
 
 	def _run_purchase_flow(self):
 		company = self._company()
 		supplier = self._random_supplier()
-		item = self._random_item()
 		wh = company.get("warehouse")
-		if not supplier or not item or not wh:
+		bom = self._random_bom(company) if random.random() < 0.5 else None
+		if bom:
+			# Buy all raw materials of a BOM
+			bom_doc = self.desk.getdoc("BOM", bom["name"]) or {}
+			lines = [(r["item_code"], r["qty"]) for r in bom_doc.get("items") or []]
+		else:
+			item = self._random_item()
+			lines = [(item, 1)] if item else []
+		if not supplier or not lines or not wh:
 			return
 
 		qty = random.randint(1, 5)
-		rate = random.choice([50, 80, 120])
-
-		po = {
-			"doctype": "Purchase Order",
+		day = _random_date()
+		posting = day.isoformat()
+		schedule = _plus(day)
+		rows = [
+			{
+				"item_code": code,
+				"qty": per_unit * qty,
+				"rate": random.choice([50, 80, 120]),
+				"schedule_date": schedule,
+				"warehouse": wh,
+			}
+			for code, per_unit in lines
+		]
+		base = {
 			"company": company["name"],
-			"supplier": supplier,
-			"transaction_date": _today(),
-			"schedule_date": _future(7),
-			"buying_price_list": config.SEED["buying_price_list"],
+			"transaction_date": posting,
+			"schedule_date": schedule,
 			"set_warehouse": wh,
-			"ignore_pricing_rule": 1,
-			"items": [
-				{
-					"doctype": "Purchase Order Item",
-					"item_code": item,
-					"qty": qty,
-					"rate": rate,
-					"schedule_date": _future(7),
-					"warehouse": wh,
-				}
-			],
 		}
-		po = self.desk.savedocs(po, "Save")
-		if not po or not po.get("name"):
-			return
-		po["doctype"] = "Purchase Order"
-		po = self.desk.savedocs(po, "Submit")
-		if not po or not po.get("name"):
+
+		if random.random() < 0.4:
+			mr = self._save_submit(
+				{
+					**base,
+					"doctype": "Material Request",
+					"material_request_type": "Purchase",
+					"items": [{**r, "doctype": "Material Request Item"} for r in rows],
+				}
+			)
+			if not mr:
+				return
+			po = self.desk.call_method(
+				"erpnext.stock.doctype.material_request.material_request.make_purchase_order",
+				{"source_name": mr["name"]},
+				name="flow:make_purchase_order",
+			)
+			if not po:
+				return
+			rates = {r["item_code"]: r["rate"] for r in rows}
+			po.update(
+				doctype="Purchase Order",
+				supplier=supplier,
+				buying_price_list=config.SEED["buying_price_list"],
+				ignore_pricing_rule=1,
+				**base,
+			)
+			for r in po.get("items") or []:
+				r["rate"] = rates.get(r.get("item_code"), 50)
+		else:
+			po = {
+				**base,
+				"doctype": "Purchase Order",
+				"supplier": supplier,
+				"buying_price_list": config.SEED["buying_price_list"],
+				"ignore_pricing_rule": 1,
+				"items": [{**r, "doctype": "Purchase Order Item"} for r in rows],
+			}
+		po = self._save_submit(po)
+		if not po:
 			return
 
-		pr = self.desk.call_method(
+		stock = {"company": company["name"], "set_posting_time": 1, "posting_date": posting}
+		pr = self._map(
 			"erpnext.buying.doctype.purchase_order.purchase_order.make_purchase_receipt",
-			{"source_name": po["name"]},
-			name="flow:make_purchase_receipt",
+			po["name"],
+			"Purchase Receipt",
+			**stock,
 		)
 		if not pr:
 			return
-		pr["doctype"] = "Purchase Receipt"
-		pr["company"] = company["name"]
-		pr["posting_date"] = _today()
-		pr = self.desk.savedocs(pr, "Save")
-		if not pr or not pr.get("name"):
-			return
-		pr["doctype"] = "Purchase Receipt"
-		pr = self.desk.savedocs(pr, "Submit")
-		if not pr or not pr.get("name"):
-			return
-
-		pi = self.desk.call_method(
+		pi = self._map(
 			"erpnext.stock.doctype.purchase_receipt.purchase_receipt.make_purchase_invoice",
-			{"source_name": pr["name"]},
-			name="flow:make_purchase_invoice",
+			pr["name"],
+			"Purchase Invoice",
+			bill_date=posting,
+			due_date=posting,
+			**stock,
 		)
-		if not pi:
-			return
-		pi["doctype"] = "Purchase Invoice"
-		pi["company"] = company["name"]
-		pi["posting_date"] = _today()
-		pi = self.desk.savedocs(pi, "Save")
-		if not pi or not pi.get("name"):
-			return
-		pi["doctype"] = "Purchase Invoice"
-		pi = self.desk.savedocs(pi, "Submit")
-		if not pi or not pi.get("name"):
-			return
-
-		self._payment_against_invoice("Purchase Invoice", pi["name"], company)
+		if pi:
+			self._payment_against_invoice("Purchase Invoice", pi["name"], company, posting)
 
 
 class StockUser(DeskMixUser):
@@ -314,6 +404,8 @@ class StockUser(DeskMixUser):
 			"company": company["name"],
 			"stock_entry_type": "Material Receipt",
 			"purpose": "Material Receipt",
+			"set_posting_time": 1,
+			"posting_date": _random_date().isoformat(),
 			"to_warehouse": wh,
 			"items": [
 				{
@@ -367,7 +459,7 @@ class AccountsUser(DeskMixUser):
 		doc = {
 			"doctype": "Journal Entry",
 			"company": company["name"],
-			"posting_date": _today(),
+			"posting_date": _random_date().isoformat(),
 			"voucher_type": "Journal Entry",
 			"accounts": [
 				{
@@ -401,11 +493,46 @@ class ManufacturingUser(DeskMixUser):
 	def loop(self):
 		roll = random.random()
 		self._list_and_open("Work Order")
-		if roll < 0.40:
-			self._list_and_open("Job Card")
-		elif roll < 0.70:
+		if roll < 0.50:
+			self._run_manufacture(self._company())
+		elif roll < 0.75:
 			self._list_and_open("BOM")
+		else:
+			self._list_and_open("Job Card")
 		self.after_loop()
+
+	def _run_manufacture(self, company: dict):
+		"""Work Order from a company BOM → Manufacture stock entry (raw materials backflushed)."""
+		bom = self._random_bom(company)
+		wh = company.get("warehouse")
+		if not bom or not wh:
+			return
+		posting = _random_date().isoformat()
+		qty = random.randint(1, 5)
+		wo = self._save_submit(
+			{
+				"doctype": "Work Order",
+				"company": company["name"],
+				"production_item": bom["item"],
+				"bom_no": bom["name"],
+				"qty": qty,
+				"skip_transfer": 1,
+				"source_warehouse": wh,
+				"wip_warehouse": wh,
+				"fg_warehouse": wh,
+				"planned_start_date": f"{posting} 09:00:00",
+			}
+		)
+		if not wo:
+			return
+		se = self.desk.call_method(
+			"erpnext.manufacturing.doctype.work_order.work_order.make_stock_entry",
+			{"work_order_id": wo["name"], "purpose": "Manufacture", "qty": qty},
+			name="flow:make_stock_entry",
+		)
+		if se:
+			se.update(doctype="Stock Entry", set_posting_time=1, posting_date=posting)
+			self._save_submit(se)
 
 
 class ReportUser(DeskMixUser):

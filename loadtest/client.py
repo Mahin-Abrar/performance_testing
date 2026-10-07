@@ -131,9 +131,11 @@ class FrappeDeskClient:
 			# Token auth may still work without csrf for GET; mark ok
 			resp.success()
 
-	def list_docs(self, doctype: str, limit: int = 20, filters: list | None = None) -> list[dict]:
+	def list_docs(
+		self, doctype: str, limit: int = 20, filters: list | None = None, fields: list | None = None
+	) -> list[dict]:
 		params: dict[str, Any] = {
-			"fields": json.dumps(["name", "modified"]),
+			"fields": json.dumps(fields or ["name", "modified"]),
 			"limit_page_length": limit,
 			"limit_start": 0,
 			"order_by": "modified desc",

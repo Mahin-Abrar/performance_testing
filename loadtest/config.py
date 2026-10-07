@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import random
+from datetime import date
 from pathlib import Path
 
 LOADTEST_DIR = Path(__file__).resolve().parent
@@ -16,6 +17,8 @@ SITE_HOST = os.environ.get("PERF_SITE_HOST", "performance")
 COMPANY = os.environ.get("PERF_COMPANY", "Fusion")  # fallback only
 PASSWORD = os.environ.get("PERF_PASSWORD", "PerfTest@123")
 FISCAL_YEAR = os.environ.get("PERF_FISCAL_YEAR", "2026-2027")
+# Transactions get a random posting date between DATE_FROM and today
+DATE_FROM = date.fromisoformat(os.environ.get("PERF_DATE_FROM", "2026-01-01"))
 
 THINK_TIME_MIN = float(os.environ.get("PERF_THINK_MIN", "3"))
 THINK_TIME_MAX = float(os.environ.get("PERF_THINK_MAX", "8"))
@@ -47,7 +50,7 @@ def load_users() -> list[dict]:
 def load_companies() -> list[dict]:
 	if not COMPANIES_FILE.exists():
 		raise FileNotFoundError(
-			f"Missing {COMPANIES_FILE}. Re-run seed to create 10 PERF companies."
+			f"Missing {COMPANIES_FILE}. Re-run seed to create 30 PERF companies."
 		)
 	return json.loads(COMPANIES_FILE.read_text())
 

@@ -8,9 +8,13 @@ Locust desk-mix load tests for ERPNext site **`performance`** (Phase 19 concurre
 # 1. Install Locust into the bench env (once)
 ./env/bin/pip install -r apps/performance_testing/requirements-loadtest.txt
 
-# 2. Seed 10 companies + masters + 100 perf_* users + API keys
+# 2. Seed 30 companies + 20k items + masters + 100 perf_* users + API keys
 bench --site performance execute performance_testing.setup.seed_loadtest.seed
 # writes loadtest/users.json and loadtest/companies.json
+
+# 2b. Optional: random transactions across companies/items (default 3000)
+bench --site performance execute performance_testing.setup.seed_loadtest.seed_transactions \
+  --kwargs '{"count": 5000}'
 
 # 3. Ensure site is serving (bench start → port 8006)
 # 4. Run Locust UI
@@ -32,14 +36,14 @@ Ramp: 5 → 10 → 25 → 50 → **100** users. HTML/CSV reports land in `loadte
 
 | Persona class | Weight | Users @100 | Write path |
 |---|---:|---:|---|
-| SalesUser | 25 | 25 | **SO → Sales Invoice → Payment Entry** (random company) |
-| PurchaseUser | 15 | 15 | **PO → Purchase Receipt → Purchase Invoice → Payment** (random company) |
+| SalesUser | 25 | 25 | **[Quotation →] SO → [Delivery Note →] Sales Invoice → Payment**; sells BOM finished goods half the time |
+| PurchaseUser | 15 | 15 | **[Material Request →] PO → Purchase Receipt → Purchase Invoice → Payment**; buys a BOM's raw materials half the time |
 | StockUser | 15 | 15 | Stock Entry / stock reports |
 | AccountsUser | 20 | 20 | Journal Entry / GL |
-| ManufacturingUser | 10 | 10 | Work Order / BOM lists |
+| ManufacturingUser | 10 | 10 | **Work Order → Manufacture stock entry** from a company BOM; Work Order / BOM / Job Card lists |
 | ReportUser | 15 | 15 | P&L, TB, Stock Balance, Sales Register |
 
-Each sales/purchase transaction picks a **random company** from the 10 seeded `PERF Company 01` … `10` entries in `companies.json`.
+Each sales/purchase transaction picks a **random company** from the 30 seeded `PERF Company 01` … `30` entries in `companies.json`. Masters include **20,000** `PERF-ITEM-*` SKUs, **100** `PERF-FG-*` finished goods with a BOM in every company, **2,000** customers and **1,000** suppliers.
 
 Think time 3–8s. Hits Desk endpoints: login / list / getdoc / savedocs / query_report / make_* mappers (not full Playwright).
 
